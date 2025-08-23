@@ -106,10 +106,11 @@ class RSAC:
                     f"The provided weights object `w` has {len(w.id_order)} ids, "
                     f"but we have {self.n_samples} samples. Please check your weights."
                 )
-            for i, nbrs in w.neighbors.items():
-                ii = int(i)
-                for j in nbrs:
-                    jj = int(j)
+            id2pos = {id_: idx for idx, id_ in enumerate(w.id_order)}
+            for i_id, nbrs in w.neighbors.items():
+                ii = id2pos[i_id]
+                for j_id in nbrs:
+                    jj = id2pos[j_id]
                     self._add_edge(self.adj_base, ii, jj, self.dist_mat[ii, jj])
         else:
             if not self.use_cluster_knn:
