@@ -7,7 +7,6 @@ from scipy.spatial.distance import pdist, squareform
 
 
 # TODO:
-#   - add a progress bar
 #   - add a min_size parameter to require a minimum number of points in the cluster
 #   - add 'complete' and 'average' linkage options
 #   - add a verbose flag to print some stats
@@ -32,7 +31,8 @@ class RSAC:
             use_cluster_knn: bool = False,
             k_extend=1,
             fit_intercept: bool = True,
-            dtype=np.float64
+            dtype=np.float64,
+            pbar=True
     ):
         """
         Ward-style clustering with regression cost & spatial constraints.
@@ -45,6 +45,7 @@ class RSAC:
         self.dtype = dtype
         self.use_cluster_knn = use_cluster_knn
         self.k_extend = k_extend
+        self.pbar = pbar
 
         if x.shape[0] != y.shape[0]:
             raise ValueError(f"x and y must have the same number of samples, got {x.shape[0]} and {y.shape[0]}.")
@@ -428,6 +429,11 @@ class RSAC:
         """
         Run until one cluster remains, saving history at each step.
         """
+
+        if self.pbar:
+            from tqdm import tqdm
+            pbar = tqdm(total=self.n_samples - 1, desc='RSAC merges')
+
         k = self.n_samples  # current number of clusters
         while k > 1 and self._heap:
             delta_rss, dist, u, v, n, rss = heapq.heappop(self._heap)
@@ -461,6 +467,9 @@ class RSAC:
                 dist_new = self.adj[new_rep].get(r_nbr, self._inf)
                 n_new = self._stats[new_rep]['n_samples'] + self._stats[r_nbr]['n_samples']
                 heapq.heappush(self._heap, (delta_new, dist_new, new_rep, r_nbr, n_new, rss_new))
+
+            if self.pbar:
+                pbar.update(1)
 
         # Clean up the _heap
         self._heap.clear()
