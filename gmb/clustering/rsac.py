@@ -1,86 +1,165 @@
 import heapq
+from typing import Dict, Set, List
 
+import libpysal
 import numpy as np
-from haversine import haversine_vector
-from scipy.sparse.csgraph import minimum_spanning_tree
 from scipy.spatial.distance import pdist, squareform
 
 
 # TODO:
-#   1. add a progress bar
-#   2. add a min_size parameter to require a minimum number of points in the cluster
-#   3. add a dynamic adjacency mode that uses k-NN outside of the cluster
-#   4. add a static adjacency mode that uses a user-provided adjacency matrix
-#   5. add 'complete' and 'average' linkage options
-#   6. add a verbose flag to print some stats
-#   7. compute the R² score also
-#   8. add documentation
-#   9. check if the model is fitted before running get_clustering
-#   10. mention that for the first n points the model will perfectly fit the data
-#   11. parametrize kNN and MST
+#   - add a progress bar
+#   - add a min_size parameter to require a minimum number of points in the cluster
+#   - add 'complete' and 'average' linkage options
+#   - add a verbose flag to print some stats
+#   - compute the R² score also
+#   - add documentation
+#   - check if the model is fitted before running get_clustering
+#   - mention that for the first n points the model will perfectly fit the data
+#   - delete the asserts at the end
 
 
 class RSAC:
     """Regression-based Spatially-constrained Agglomerative Clustering"""
 
-    def __init__(self,
-                 x, y, coords,
-                 fit_intercept=True,
-                 dynamic_adjacency=False,
-                 static_adjacency=None,
-                 knn_k=3,
-                 distance_metric='euclidean',
-                 dtype=np.float64):
+    def __init__(
+            self,
+            x: np.ndarray,
+            y: np.ndarray,
+            *,
+            w: libpysal.weights.W = None,
+            coords: np.ndarray = None,
+            dist_mat: np.ndarray = None,
+            use_cluster_knn: bool = False,
+            k_extend=1,
+            fit_intercept: bool = True,
+            dtype=np.float64
+    ):
         """
         Ward-style clustering with regression cost & spatial constraints.
         """
+
         if fit_intercept:
             x = np.hstack([np.ones((x.shape[0], 1)), x])
         self.x, self.y = x.astype(dtype), y.astype(dtype)
         self.n_samples, self.n_feat = x.shape
         self.dtype = dtype
-        self.coords = np.asarray(coords)
-        self.dynamic_adjacency = dynamic_adjacency
-        self.static_adjacency = static_adjacency
-        self.knn_k = knn_k
+        self.use_cluster_knn = use_cluster_knn
+        self.k_extend = k_extend
+
+        if x.shape[0] != y.shape[0]:
+            raise ValueError(f"x and y must have the same number of samples, got {x.shape[0]} and {y.shape[0]}.")
+
+        self.coords = np.asarray(coords, dtype=dtype) if coords is not None else None
+
+        # Prepare/check the distance matrix (dist_mat has priority if provided; else compute from coords)
+        if dist_mat is not None:
+            dm = np.asarray(dist_mat, dtype=self.dtype)
+            if dm.shape != (self.n_samples, self.n_samples):
+                raise ValueError(f"dist_mat must be shape {(self.n_samples, self.n_samples)}, got {dm.shape}.")
+
+            # Fill diagonal with zeros and check symmetry & non-negativity
+            np.fill_diagonal(dm, self.dtype(0.0))
+            if not np.allclose(dm, dm.T):
+                raise ValueError("dist_mat must be symmetric.")
+
+            if np.any(dm < 0) or np.any(~np.isfinite(dm)):
+                raise ValueError("dist_mat must have all finite non-negative values.")
+
+            self.dist_mat = dm
+        else:
+            if coords is None:
+                raise ValueError("Provide either `dist_mat` or `coords` to define spatial distances.")
+            self.coords = np.asarray(coords, dtype=self.dtype)
+            if self.coords.shape[0] != self.n_samples:
+                raise ValueError(
+                    f"coords must have n rows == n_samples ({self.n_samples}), got {self.coords.shape[0]}"
+                )
+            self.dist_mat = squareform(pdist(self.coords)).astype(self.dtype)
+
+        # Infinity constant for convenience
+        self._inf = self.dtype(np.inf)
 
         # DSU parent pointers
-        self.parent = {i: i for i in range(self.n_samples)}
+        self._parent = {i: i for i in range(self.n_samples)}
 
         # Init per-cluster stats & member sets
-        self.stats, self.members = {}, {}
+        self._stats, self._members = {}, {}
         for i in range(self.n_samples):
-            xi = x[i].reshape(-1, 1)
-            self.stats[i] = {
+            xi = self.x[i].reshape(-1, 1)
+            self._stats[i] = {
                 'n_samples': 1,
                 'XtX': xi @ xi.T,
-                'Xty': (xi.flatten() * y[i]),
-                'ySS': y[i] ** 2,
-                'RSS': dtype(0.0)
+                'Xty': (xi.flatten() * self.y[i]),
+                'ySS': self.y[i] ** 2,
+                'RSS': self.dtype(0.0)
             }
-            self.members[i] = {i}
+            self._members[i] = {i}
 
-        # Precompute the distance matrix depending on the metric
-        if distance_metric == 'euclidean':
-            self.dist_mat = squareform(pdist(self.coords)).astype(self.dtype)
-        elif distance_metric == 'haversine':
-            self.dist_mat = haversine_vector(self.coords, self.coords).astype(self.dtype)
+        # 1) Build base adjacency from W (if given, otherwise, we expect use_cluster_knn to be True)
+        self.adj_base: Dict[int, Dict[int, np.floating]] = {i: {} for i in range(self.n_samples)}
+
+        if w is not None:
+            if w.max_neighbors == 0:
+                raise ValueError("The provided weights object `w` has no neighbors. Please check your weights.")
+            if len(w.id_order) != self.n_samples:
+                raise ValueError(
+                    f"The provided weights object `w` has {len(w.id_order)} ids, "
+                    f"but we have {self.n_samples} samples. Please check your weights."
+                )
+            for i, nbrs in w.neighbors.items():
+                ii = int(i)
+                for j in nbrs:
+                    jj = int(j)
+                    self._add_edge(self.adj_base, ii, jj, self.dist_mat[ii, jj])
         else:
-            raise ValueError(f"Unknown distance_metric {distance_metric}")
-        self._dist = lambda i, j: self.dist_mat[i, j]  # direct access function
+            if not self.use_cluster_knn:
+                raise ValueError("No contiguity `w` provided. Either supply `w` or enable `use_cluster_knn=True`.")
+        deg = {u: len(nbrs) for u, nbrs in self.adj_base.items()}
+        print(
+            f"adj_base stats: #nodes: {len(deg)}, #edges: {sum(deg.values()) // 2}, "
+            f"min/mean/max degree: {min(deg.values())}/{np.mean(list(deg.values())):.1f}/{max(deg.values())}"
+        )
 
-        # Build the adjacency structure depending on the mode
-        if self.dynamic_adjacency:
-            self._build_dynamic_adjacency_all()
-        else:
-            if self.static_adjacency is not None:
-                self._use_external_static_adjacency()
-            else:
-                self._build_static_adjacency()
+        # 2) If `use_cluster_knn` is set to True, extend the adjacency with k-NN outside each "cluster"
+        # (i.e. point since we start with each point as a cluster, so equivalent to a standard k-NN)
+        if self.use_cluster_knn:
+            if self.k_extend < 1:
+                raise ValueError(f"k_extend must be a positive integer if `use_cluster_knn=True', got {self.k_extend}.")
 
-        # Initialize the heap using tuples of (delta_RSS, spatial_dist, u, v, n, RSS)
-        # => the first two values are used to sort the heap, the rest is used for merging
-        self.heap = []
+            # Build pre-sorted neighbor index once; store neighbors (excluding self) by ascending distance
+            order = np.argsort(self.dist_mat, axis=1).astype(np.int32)
+            self._order_mat = np.empty((self.n_samples, self.n_samples - 1), dtype=np.int32)
+            for i in range(self.n_samples):
+                row = order[i]
+                if row[0] == i:
+                    self._order_mat[i] = row[1:]
+                else:
+                    # rare if diagonal not strictly smallest; still drop i
+                    self._order_mat[i] = row[row != i][: self.n_samples - 1]
+            print("Neighbor index built (pre-sorted rows with cursors).")
+
+            # Per-point advancing cursor (starts at 0, only moves forward)
+            self._cursor = np.zeros(self.n_samples, dtype=np.int32)
+
+            # Initialize the extended adjacency structure
+            self.adj_cknn: Dict[int, Dict[int, np.floating]] = {i: {} for i in range(self.n_samples)}
+            for rep in self._members:
+                edges = self._compute_cluster_knn_for(rep)
+                for tgt, d in edges.items():
+                    self._add_edge(self.adj_cknn, rep, tgt, d)
+
+            deg = {u: len(nbrs) for u, nbrs in self.adj_cknn.items()}
+            print(
+                f"adj_cknn stats: #nodes: {len(deg)}, #edges: {sum(deg.values()) // 2}, "
+                f"min/mean/max degree: {min(deg.values())}/{np.mean(list(deg.values())):.1f}/{max(deg.values())}"
+            )
+
+        # merge the base and extended adjacency into a single adjacency structure
+        self._refresh_adj()
+
+        # Initialize the _heap using tuples of (delta_RSS, spatial_dist, u, v, n, RSS)
+        # => the first two values are used to sort the _heap, the rest is used for merging
+        self._heap: List[tuple] = []
         seen = set()
         for u, nbrs in self.adj.items():
             for v, dist in nbrs.items():
@@ -88,80 +167,115 @@ class RSAC:
                     continue
                 seen.add((u, v))
                 rss, delta_rss = self._delta_rss(u, v)
-                heapq.heappush(self.heap, (delta_rss, dist, u, v, 2, delta_rss))  # n=2 for the first merge
+                heapq.heappush(self._heap, (delta_rss, dist, u, v, 2, rss))  # n=2 for the first merge
+        heapq.heapify(self._heap)
+        print(f"Built initial heap with {len(self._heap)} candidate merges.")
 
         # Record all the intermediate clustering states so we can retrieve them later
         self.history = {self.n_samples: {i: i for i in range(self.n_samples)}}
 
-    def _use_external_static_adjacency(self):
-        """Convert static_adjacency input into self.adj."""
-        adj = {i: {} for i in range(self.n_samples)}
-        sa = self.static_adjacency
-        if isinstance(sa, dict):
-            for u, nbrs in sa.items():
-                if isinstance(nbrs, dict):
-                    for v, d in nbrs.items():
-                        adj[u][v] = d
-                        adj[v][u] = d
-                else:
-                    for v in nbrs:
-                        d = self._dist(u, v)
-                        adj[u][v] = d
-                        adj[v][u] = d
-        else:
-            for u, v in sa:
-                d = self._dist(u, v)
-                adj[u][v] = d
-                adj[v][u] = d
+    def _add_edge(self, layer: Dict[int, Dict[int, np.floating]], u: int, v: int, d):
+        """Undirected min-weight add: ensure u<->v exist with the smaller of existing and d."""
+        if u == v:
+            return
+
+        if v in layer[u] and u in layer[v]:
+            assert layer[u][v] == layer[v][u], "Asymmetric edge weight detected"
+
+        if u not in layer:
+            layer[u] = {}
+
+        if v not in layer:
+            layer[v] = {}
+
+        # Get the minimum distance and set it both ways
+        best = min(d, layer[u].get(v, self._inf))
+        layer[u][v] = layer[v][u] = best
+
+    def _nearest_outside_neighbor(self, p: int, rep: int):
+        """Return (target_rep, distance) for the nearest neighbor of point p that is **outside** cluster `rep`.
+        Uses the pre-sorted neighbor list with a per-point cursor that only advances (lazy deletion).
+        """
+        row = self._order_mat[p]
+        i = int(self._cursor[p])  # current pointer into row
+        m = row.shape[0]
+
+        # Advance past same-cluster neighbors lazily
+        while i < m and self._find(int(row[i])) == rep:
+            i += 1
+        self._cursor[p] = i  # persist new pointer (monotone increasing)
+        if i < m:
+            q = int(row[i])
+            return self._find(q), self.dist_mat[p, q]
+        return None
+
+    def _compute_cluster_knn_for(self, rep: int) -> Dict[int, np.floating]:
+        """Compute (but do not apply) up to k_extend target clusters and distances for `rep`.
+
+        We look ahead in each member's neighbor list and gather the best distinct targets until we have gathered
+        `k_extend` distinct targets or exhausted all members.
+
+        This scan does not consume neighbors globally, except that we persist skipping of now-inside-cluster neighbors
+        by advancing the stored cursor up to the first outside neighbor.
+        """
+        best_per_target: Dict[int, np.floating] = {}
+
+        for p in self._members[rep]:
+            row = self._order_mat[p]
+            i = int(self._cursor[p])
+            m = row.shape[0]
+
+            # Advance to first outside-neighbor for current membership and persist that position
+            while i < m and self._find(int(row[i])) == rep:
+                i += 1
+            self._cursor[p] = i
+
+            # Look ahead locally to gather more distinct targets, without consuming the global cursor
+            j = i
+            while j < m and len(best_per_target) < self.k_extend:
+                q = int(row[j])
+                tgt = self._find(q)
+                if tgt != rep:
+                    d = self.dist_mat[p, q]
+                    prev = best_per_target.get(tgt)
+                    if prev is None or d < prev:
+                        best_per_target[tgt] = d
+                j += 1
+
+            if len(best_per_target) >= self.k_extend:
+                break
+
+        # Top-k distinct target clusters by min witness distance
+        out: Dict[int, np.floating] = {}
+        for tgt, d in sorted(best_per_target.items(), key=lambda t: t[1])[: self.k_extend]:
+            out[tgt] = d
+        return out
+
+    def _refresh_adj(self):
+        """Update the union of base and cKNN adjacency."""
+
+        if not self.use_cluster_knn:
+            # If we don't extend adjacency, just use the base adjacency
+            self.adj = self.adj_base
+            return
+
+        adj: Dict[int, Dict[int, np.floating]] = {i: {} for i in range(self.n_samples)}
+
+        for u, nbrs in self.adj_base.items():
+            for v, d in nbrs.items():
+                self._add_edge(adj, u, v, d)
+
+        for u, nbrs in self.adj_cknn.items():
+            for v, d in nbrs.items():
+                self._add_edge(adj, u, v, d)
+
         self.adj = adj
-
-    def _build_static_adjacency(self):
-        """k-NN + MST based on precomputed dist_mat."""
-        self.adj = {i: {} for i in range(self.n_samples)}
-
-        # k-NN
-        for i in range(self.n_samples):
-            order = np.argsort(self.dist_mat[i])
-            for j in order[1: self.knn_k + 1]:
-                d = self._dist(i, j)
-                self.adj[i][int(j)] = d
-                self.adj[int(j)][i] = d
-
-        # count the number of edges
-        n_edges = sum(len(nbrs) for nbrs in self.adj.values()) // 2
-        print(f"Number of edges in the k-NN graph: {n_edges}")
-
-        # MST
-        mst = minimum_spanning_tree(self.dist_mat).toarray().astype(self.dtype)
-        rows, cols = np.nonzero(mst)
-        for i, j in zip(rows, cols):
-            if i < j:
-                self.adj[int(i)][int(j)] = mst[i, j]
-                self.adj[int(j)][int(i)] = mst[i, j]
-
-        n_edges = sum(len(nbrs) for nbrs in self.adj.values()) // 2
-        print(f"Number of edges after adding the MST graph: {n_edges}")
 
     def _find(self, u):
         """Path-compressed DSU find."""
-        if self.parent[u] != u:
-            self.parent[u] = self._find(self.parent[u])
-        return self.parent[u]
-
-    def _build_dynamic_adjacency_all(self):
-        """Initial per-point NN-outside using dist_mat."""
-        self.adj = {i: {} for i in range(self.n_samples)}
-        for i in range(self.n_samples):
-            dists = self.dist_mat[i].copy()
-            dists[i] = np.inf
-            j = np.argmin(dists)
-            if not np.isinf(dists[j]):
-                d = self.dtype(dists[j])
-                ri, rj = self._find(i), self._find(j)
-                self.adj[ri][rj] = d
-                self.adj[rj][ri] = d
-        n_edges = sum(len(nbrs) for nbrs in self.adj.values()) // 2
-        print(f"Number of edges in the initial dynamic adjacency: {n_edges}")
+        if self._parent[u] != u:
+            self._parent[u] = self._find(self._parent[u])
+        return self._parent[u]
 
     @staticmethod
     def _safe_solve(xtx, xty):
@@ -173,7 +287,7 @@ class RSAC:
 
     def _delta_rss(self, u, v):
         ru, rv = self._find(u), self._find(v)
-        sa, sb = self.stats[ru], self.stats[rv]
+        sa, sb = self._stats[ru], self._stats[rv]
         n_samples_total = sa['n_samples'] + sb['n_samples']
 
         # Return 0 if we don't have enough points to fit a linear model (as we will perfectly fit the data)
@@ -199,14 +313,65 @@ class RSAC:
 
         return rss_ab, delta_rss
 
-    def _spatial_dist(self, u, v):
+    def _rebuild_base_after_merge(self, keep: int, drop: int):
+        """Contract base adjacency after merging `drop` into `keep`.
+
+        For single-linkage, d(A + B, C) = min(d(A, C), d(B, C)).
+        We therefore update weights without any pointwise distance computations.
         """
-        Min-distance between clusters u,v using dist_mat (~single-linkage distance for the clusters).
+
+        # Capture old neighbor maps
+        nbrs_keep = dict(self.adj_base.get(keep, {}))
+        nbrs_drop = dict(self.adj_base.get(drop, {}))
+        all_nbrs = (set(nbrs_keep.keys()) | set(nbrs_drop.keys())) - {keep, drop}
+
+        # Remove old references to keep/drop from neighbors
+        for nb in nbrs_keep:
+            self.adj_base[nb].pop(keep, None)
+        for nb in nbrs_drop:
+            self.adj_base[nb].pop(drop, None)
+
+        # New neighbor map for keep
+        new_map = {}
+        for nb in all_nbrs:
+            d1 = nbrs_keep.get(nb, self._inf)
+            d2 = nbrs_drop.get(nb, self._inf)
+            d = d1 if d1 < d2 else d2
+            if np.isfinite(d):
+                new_map[nb] = d
+        self.adj_base[keep] = {}
+        for nb, d in new_map.items():
+            self._add_edge(self.adj_base, keep, nb, d)
+
+        # Remove representative `drop`
+        self.adj_base.pop(drop, None)
+
+    def _rebuild_cknn_after_merge_for(self, reps: Set[int]):
         """
-        pu = list(self.members[u])
-        pv = list(self.members[v])
-        dists = self.dist_mat[np.ix_(pu, pv)]
-        return np.min(dists)
+        Two-steps local rebuild for cKNN on a set of representatives:
+            Step 1: compute new edges for each rep.
+            Step 2: wipe current incident edges for those reps and re-add exactly the new edges (symmetrically).
+        """
+        if not self.use_cluster_knn or not reps:
+            return
+
+        # Step 1: compute new edges per rep
+        new_edges_map: Dict[int, Dict[int, np.floating]] = {}
+        for rep in reps:
+            if rep in self._members:  # still alive
+                new_edges_map[rep] = self._compute_cluster_knn_for(rep)
+
+        # Step 2: wipe current incident edges for touched reps (symmetrically)
+        for rep in new_edges_map.keys():
+            for nb in list(self.adj_cknn.get(rep, {}).keys()):
+                # remove both directions
+                self.adj_cknn[nb].pop(rep, None)
+            self.adj_cknn[rep] = {}
+
+        # Re-add the new edges
+        for rep, edges in new_edges_map.items():
+            for nb, d in edges.items():
+                self._add_edge(self.adj_cknn, rep, nb, d)
 
     def _merge(self, u, v, new_rss):
         # Get the root representatives of u and v
@@ -215,74 +380,56 @@ class RSAC:
         # They should not be the same
         assert ru != rv, f"The representatives of {u} and {v} are the same: {ru} == {rv}"
 
-        # 2) Set the new representative
-        new_rep, old_rep = ru, rv
+        # Set the new representative
+        keep, drop = ru, rv
 
-        # 3) Contract the neighborhoods of the two clusters
-        nbrs_new = set(self.adj.get(new_rep, {}).keys())
-        nbrs_old = set(self.adj.get(old_rep, {}).keys())
-        nbrs_combined = (nbrs_new | nbrs_old) - {new_rep, old_rep}
+        # Save the cKNN neighbors before the merge (for touched set)
+        if self.use_cluster_knn:
+            cknn_neigh_keep = set(self.adj_cknn.get(keep, {}).keys())
+            cknn_neigh_drop = set(self.adj_cknn.get(drop, {}).keys())
 
-        # 3.1) Remove old edges between the representatives of the two clusters and their neighbors
-        for nbr in nbrs_new:
-            self.adj[nbr].pop(new_rep, None)
-        for nbr in nbrs_old:
-            self.adj[nbr].pop(old_rep, None)
+        # Update the base adjacency structure after merging
+        self._rebuild_base_after_merge(keep, drop)
 
-        # 3.2) Build contracted adjacency for new_rep
-        self.adj[new_rep] = {}
-        for nbr in nbrs_combined:
-            d = self._dist(new_rep, nbr)
-            self.adj[new_rep][nbr] = d
-            self.adj[nbr][new_rep] = d
+        # Merge the members of the two clusters
+        self._parent[drop] = keep
+        self._members[keep] |= self._members[drop]
+        del self._members[drop]
 
-        # 3.3) Remove old_rep from adjacency dict
-        if old_rep in self.adj:
-            del self.adj[old_rep]
-
-        # 4) Merge the members of the two clusters
-        self.parent[old_rep] = new_rep
-        self.members[new_rep] |= self.members[old_rep]
-        del self.members[old_rep]
-
-        # 5) Merge the stats into the new representative and delete the old ones
-        sa, sb = self.stats[new_rep], self.stats[old_rep]
+        # Merge the stats into the new representative and delete the old ones
+        sa, sb = self._stats[keep], self._stats[drop]
         sa['n_samples'] += sb['n_samples']
         sa['XtX'] += sb['XtX']
         sa['Xty'] += sb['Xty']
         sa['ySS'] += sb['ySS']
-        sa['RSS'] = new_rss  # use the provided new_rss for the merged cluster which was kept in the heap
-        del self.stats[old_rep]
+        sa['RSS'] = new_rss  # use the provided new_rss for the merged cluster which was kept in the _heap
+        del self._stats[drop]
 
-        # If used, update the adjacency structure
-        # (clean up the old edges & add new edges between the new representative and its external closest neighbors)
-        if self.dynamic_adjacency:
-            for nbr in list(self.adj[new_rep]):
-                self.adj[nbr].pop(new_rep, None)
-            self.adj[new_rep].clear()
-            for pt in self.members[new_rep]:
-                dists = self.dist_mat[pt].copy()
-                for j in self.members[new_rep]:
-                    dists[j] = self.dtype(np.inf)
-                jmin = np.argmin(dists)
-                if not np.isinf(dists[jmin]):
-                    rj = self._find(jmin)
-                    if rj != new_rep:
-                        d = dists[jmin]
-                        self.adj[new_rep][rj] = d
-                        self.adj[rj][new_rep] = d
-        return new_rep
+        # Update cluster‑kNN layer (with local rebuild, i.e. only the affected representatives)
+        if self.use_cluster_knn:
+            # These are the nodes whose cluster‑kNN needs to be recomputed
+            touched: Set[int] = {keep} | cknn_neigh_keep | cknn_neigh_drop
+
+            # Remove the dropped rep’s entry and all edges to it
+            for nb in list(self.adj_cknn.get(drop, {}).keys()):
+                self.adj_cknn[nb].pop(drop, None)
+            self.adj_cknn.pop(drop, None)
+
+            # Recompute cluster‑kNN for all the touched nodes
+            self._rebuild_cknn_after_merge_for(touched)
+
+        # Refresh the adjacency structure
+        self._refresh_adj()
+
+        return keep
 
     def fit(self):
         """
         Run until one cluster remains, saving history at each step.
         """
-        heapq.heapify(self.heap)
-        print(f"Initial heap size: {len(self.heap)}")
-
         k = self.n_samples  # current number of clusters
-        while k > 1 and self.heap:
-            delta_rss, dist, u, v, n, rss = heapq.heappop(self.heap)
+        while k > 1 and self._heap:
+            delta_rss, dist, u, v, n, rss = heapq.heappop(self._heap)
             ru, rv = self._find(u), self._find(v)
 
             # If they are already in the same cluster, skip this pair
@@ -292,7 +439,7 @@ class RSAC:
             # Secondly, it could be that the clusters of u and v grew meanwhile => delta_RSS is obsolete
             # We check how many samples we had at the time when we computed the delta_RSS and then compare it to the
             # actual size of the cluster we are about to build
-            if n != (self.stats[ru]['n_samples'] + self.stats[rv]['n_samples']):  # obsolete merge, skip it
+            if n != (self._stats[ru]['n_samples'] + self._stats[rv]['n_samples']):  # obsolete merge, skip it
                 continue
 
             # Merge the two clusters
@@ -302,15 +449,23 @@ class RSAC:
             # Save the current configuration
             self.history[k] = {i: self._find(i) for i in range(self.n_samples)}
 
-            # Add new candidate merges between the newly formed cluster and its neighbors
-            for nbr, _ in self.adj[new_rep].items():
-                rss_new, delta_rss_new = self._delta_rss(new_rep, nbr)
-                dist_new = self._spatial_dist(new_rep, nbr)
-                n_samples_new = self.stats[new_rep]['n_samples'] + self.stats[nbr]['n_samples']
-                heapq.heappush(self.heap, (delta_rss_new, dist_new, new_rep, nbr, n_samples_new, rss_new))
+            # Push fresh candidates between the new cluster and its neighbors
+            for nbr, d_curr in list(self.adj[new_rep].items()):
+                r_nbr = self._find(nbr)
+                if r_nbr == new_rep:
+                    continue
+                rss_new, delta_new = self._delta_rss(new_rep, r_nbr)
 
-        # Clean up the heap
-        self.heap.clear()
+                # Use current union adjacency weight for tie-breaking
+                dist_new = self.adj[new_rep].get(r_nbr, self._inf)
+                n_new = self._stats[new_rep]['n_samples'] + self._stats[r_nbr]['n_samples']
+                heapq.heappush(self._heap, (delta_new, dist_new, new_rep, r_nbr, n_new, rss_new))
+
+        # Clean up the _heap
+        self._heap.clear()
+
+        if k != 1:
+            print(f"Warning: stopped with {k} clusters remaining (probably disconnected components).")
 
         return self
 
