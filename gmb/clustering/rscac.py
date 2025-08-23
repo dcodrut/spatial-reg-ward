@@ -461,10 +461,31 @@ class RSCAC:
         self._heap.clear()
 
         if k != 1:
-            print(f"Warning: stopped with {k} clusters remaining (probably disconnected components).")
+            print(
+                f"Warning: RSCAC should stop when everything is merged into one cluster but we still have {k} clusters "
+                f"(probably disconnected components)."
+            )
 
-        return self
+        # Get the labels for the requested number of clusters
+        labels = self.get_labels(k=self.n_clusters)
+        return labels
 
-    def get_labels(self, k):
+    def get_labels(self, k: int = None):
         """Retrieve labels for exactly k clusters."""
-        return self.history.get(k)
+        k = self.n_clusters if k is None else int(k)
+        labels = np.asarray(list(self.history.get(k).values()))
+
+        # Relabel to 0, 1, ..., k-1
+        uniq = np.unique(labels)
+        mapping = {old: new for new, old in enumerate(uniq)}
+        labels = np.vectorize(mapping.get)(labels)
+
+        # Check if the min_cluster_size constraint is satisfied
+        if self.min_cluster_size > 1:
+            sizes = np.bincount(labels)
+            if min(sizes) < self.min_cluster_size:
+                print(
+                    f"Warning: the minimum cluster size constraint of {self.min_cluster_size} is not satisfied. "
+                    f"The smallest cluster has size {min(sizes)}. Reconsider decreasing min_cluster_size."
+                )
+        return labels
