@@ -7,12 +7,9 @@ from scipy.spatial.distance import pdist, squareform
 
 
 # TODO:
-#   - add a min_size parameter to require a minimum number of points in the cluster
-#   - add 'complete' and 'average' linkage options
 #   - add a verbose flag to print some stats
 #   - add documentation
 #   - check if the model is fitted before running get_clustering
-#   - mention that for the first n points the model will perfectly fit the data
 #   - delete the asserts at the end
 
 
@@ -23,10 +20,12 @@ class RSCAC:
             self,
             x: np.ndarray,
             y: np.ndarray,
+            n_clusters: int,
             *,
             w: libpysal.weights.W = None,
             coords: np.ndarray = None,
             dist_mat: np.ndarray = None,
+            min_cluster_size: int = 1,
             use_cluster_knn: bool = False,
             fit_intercept: bool = True,
             dtype=np.float64,
@@ -39,13 +38,15 @@ class RSCAC:
         if fit_intercept:
             x = np.hstack([np.ones((x.shape[0], 1)), x])
         self.x, self.y = x.astype(dtype), y.astype(dtype)
-        self.n_samples, self.n_feat = x.shape
+        self.n_clusters = int(n_clusters)
+        self.min_cluster_size = int(min_cluster_size)
+        self.use_cluster_knn = bool(use_cluster_knn)
         self.dtype = dtype
-        self.use_cluster_knn = use_cluster_knn
         self.pbar = pbar
 
         if x.shape[0] != y.shape[0]:
             raise ValueError(f"x and y must have the same number of samples, got {x.shape[0]} and {y.shape[0]}.")
+        self.n_samples, self.n_feat = x.shape
 
         self.coords = np.asarray(coords, dtype=dtype) if coords is not None else None
 
@@ -153,8 +154,10 @@ class RSCAC:
         # merge the base and extended adjacency into a single adjacency structure
         self._refresh_adj()
 
-        # Initialize the _heap using tuples of (delta_RSS, spatial_dist, u, v, n, RSS)
-        # => the first two values are used to sort the _heap, the rest is used for merging
+        # Initialize the _heap using tuples of (priority, delta_RSS, spatial_dist, u, v, n, RSS)
+        # (the first three values are used to sort the _heap, the rest is used for merging)
+        # priority is used to give preference to merges between small members (below min_cluster_size)
+        # i.e. -2 (highest) if both clusters are small, -1 if one is small, 0 if both are large
         self._heap: List[tuple] = []
         seen = set()
         for u, nbrs in self.adj.items():
@@ -163,7 +166,9 @@ class RSCAC:
                     continue
                 seen.add((u, v))
                 rss, delta_rss = self._delta_rss(u, v)
-                heapq.heappush(self._heap, (delta_rss, dist, u, v, 2, rss))  # n=2 for the first merge
+                n_new = 2  # we start with singletons
+                priority = - 2  # highest priority for singletons
+                heapq.heappush(self._heap, (priority, delta_rss, dist, u, v, n_new, rss))
         heapq.heapify(self._heap)
         print(f"Built initial heap with {len(self._heap)} candidate merges.")
 
@@ -408,7 +413,7 @@ class RSCAC:
 
         k = self.n_samples  # current number of clusters
         while k > 1 and self._heap:
-            delta_rss, dist, u, v, n, rss = heapq.heappop(self._heap)
+            _, _, _, u, v, n, rss = heapq.heappop(self._heap)
             ru, rv = self._find(u), self._find(v)
 
             # If they are already in the same cluster, skip this pair
@@ -437,8 +442,13 @@ class RSCAC:
 
                 # Use current union adjacency weight for tie-breaking
                 dist_new = self.adj[new_rep].get(r_nbr, self._inf)
-                n_new = self._stats[new_rep]['n_samples'] + self._stats[r_nbr]['n_samples']
-                heapq.heappush(self._heap, (delta_new, dist_new, new_rep, r_nbr, n_new, rss_new))
+                new_s1 = self._stats[new_rep]['n_samples']
+                new_s2 = self._stats[r_nbr]['n_samples']
+                n_new = new_s1 + new_s2
+
+                # Give a (high) priority to merges between small clusters
+                priority = -int(new_s1 < self.min_cluster_size) - int(new_s2 < self.min_cluster_size)
+                heapq.heappush(self._heap, (priority, delta_new, dist_new, new_rep, r_nbr, n_new, rss_new))
 
             if self.pbar:
                 # Compute the total RSS over all clusters (for information only) and the resulting R^2
