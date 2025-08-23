@@ -16,8 +16,8 @@ from scipy.spatial.distance import pdist, squareform
 #   - delete the asserts at the end
 
 
-class RSAC:
-    """Regression-based Spatially-constrained Agglomerative Clustering"""
+class RSCAC:
+    """Regression-based Spatially-Constrained Agglomerative Clustering"""
 
     def __init__(
             self,
@@ -28,7 +28,6 @@ class RSAC:
             coords: np.ndarray = None,
             dist_mat: np.ndarray = None,
             use_cluster_knn: bool = False,
-            k_extend=1,
             fit_intercept: bool = True,
             dtype=np.float64,
             pbar=True
@@ -43,7 +42,6 @@ class RSAC:
         self.n_samples, self.n_feat = x.shape
         self.dtype = dtype
         self.use_cluster_knn = use_cluster_knn
-        self.k_extend = k_extend
         self.pbar = pbar
 
         if x.shape[0] != y.shape[0]:
@@ -124,9 +122,6 @@ class RSAC:
         # 2) If `use_cluster_knn` is set to True, extend the adjacency with k-NN outside each "cluster"
         # (i.e. point since we start with each point as a cluster, so equivalent to a standard k-NN)
         if self.use_cluster_knn:
-            if self.k_extend < 1:
-                raise ValueError(f"k_extend must be a positive integer if `use_cluster_knn=True', got {self.k_extend}.")
-
             # Build pre-sorted neighbor index once; store neighbors (excluding self) by ascending distance
             order = np.argsort(self.dist_mat, axis=1).astype(np.int32)
             self._order_mat = np.empty((self.n_samples, self.n_samples - 1), dtype=np.int32)
@@ -211,46 +206,20 @@ class RSAC:
         return None
 
     def _compute_cluster_knn_for(self, rep: int) -> Dict[int, np.floating]:
-        """Compute (but do not apply) up to k_extend target clusters and distances for `rep`.
-
-        We look ahead in each member's neighbor list and gather the best distinct targets until we have gathered
-        `k_extend` distinct targets or exhausted all members.
-
-        This scan does not consume neighbors globally, except that we persist skipping of now-inside-cluster neighbors
-        by advancing the stored cursor up to the first outside neighbor.
         """
-        best_per_target: Dict[int, np.floating] = {}
-
+        Given the current cluster `rep`, for EACH member point pick its SINGLE nearest neighbor that lies in a
+        different cluster. Return the distinct target clusters with the minimum witnessing distance per target.
+        """
+        targets: Dict[int, np.floating] = {}
         for p in self._members[rep]:
-            row = self._order_mat[p]
-            i = int(self._cursor[p])
-            m = row.shape[0]
-
-            # Advance to first outside-neighbor for current membership and persist that position
-            while i < m and self._find(int(row[i])) == rep:
-                i += 1
-            self._cursor[p] = i
-
-            # Look ahead locally to gather more distinct targets, without consuming the global cursor
-            j = i
-            while j < m and len(best_per_target) < self.k_extend:
-                q = int(row[j])
-                tgt = self._find(q)
-                if tgt != rep:
-                    d = self.dist_mat[p, q]
-                    prev = best_per_target.get(tgt)
-                    if prev is None or d < prev:
-                        best_per_target[tgt] = d
-                j += 1
-
-            if len(best_per_target) >= self.k_extend:
-                break
-
-        # Top-k distinct target clusters by min witness distance
-        out: Dict[int, np.floating] = {}
-        for tgt, d in sorted(best_per_target.items(), key=lambda t: t[1])[: self.k_extend]:
-            out[tgt] = d
-        return out
+            res = self._nearest_outside_neighbor(p, rep)  # advances cursor up to first outside neighbor
+            if res is None:
+                continue
+            tgt, d = res
+            prev = targets.get(tgt, self._inf)
+            if d < prev:
+                targets[tgt] = d
+        return targets
 
     def _refresh_adj(self):
         """Update the union of base and cKNN adjacency."""
@@ -431,7 +400,7 @@ class RSAC:
 
         if self.pbar:
             from tqdm import tqdm
-            pbar = tqdm(total=self.n_samples - 1, desc='RSAC merges')
+            pbar = tqdm(total=self.n_samples - 1, desc='RSCAC merges')
 
             # Compute TSS for the entire dataset (for information only)
             y_mean = np.mean(self.y)
