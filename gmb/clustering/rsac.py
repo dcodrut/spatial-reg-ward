@@ -10,7 +10,6 @@ from scipy.spatial.distance import pdist, squareform
 #   - add a min_size parameter to require a minimum number of points in the cluster
 #   - add 'complete' and 'average' linkage options
 #   - add a verbose flag to print some stats
-#   - compute the R² score also
 #   - add documentation
 #   - check if the model is fitted before running get_clustering
 #   - mention that for the first n points the model will perfectly fit the data
@@ -434,6 +433,10 @@ class RSAC:
             from tqdm import tqdm
             pbar = tqdm(total=self.n_samples - 1, desc='RSAC merges')
 
+            # Compute TSS for the entire dataset (for information only)
+            y_mean = np.mean(self.y)
+            tss = np.sum((self.y - y_mean) ** 2)
+
         k = self.n_samples  # current number of clusters
         while k > 1 and self._heap:
             delta_rss, dist, u, v, n, rss = heapq.heappop(self._heap)
@@ -469,6 +472,10 @@ class RSAC:
                 heapq.heappush(self._heap, (delta_new, dist_new, new_rep, r_nbr, n_new, rss_new))
 
             if self.pbar:
+                # Compute the total RSS over all clusters (for information only) and the resulting R^2
+                total_rss = sum(s['RSS'] for s in self._stats.values())
+                r2 = 1.0 - max(total_rss, 0.0) / tss if tss > 0 else 1.0
+                pbar.set_postfix({'k': k, 'R²': f"{r2:.4f}"})
                 pbar.update(1)
 
         # Clean up the _heap
