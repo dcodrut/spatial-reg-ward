@@ -29,6 +29,7 @@ class RSCAC:
             use_cluster_knn: bool = False,
             fit_intercept: bool = True,
             dtype=np.float64,
+            rss_delta_atol: float = 1e-6,
             pbar=True
     ):
         """
@@ -42,6 +43,7 @@ class RSCAC:
         self.min_cluster_size = int(min_cluster_size)
         self.use_cluster_knn = bool(use_cluster_knn)
         self.dtype = dtype
+        self.rss_delta_atol = self.dtype(rss_delta_atol)
         self.pbar = pbar
 
         if x.shape[0] != y.shape[0]:
@@ -265,7 +267,7 @@ class RSCAC:
         sa, sb = self._stats[ru], self._stats[rv]
         n_samples_total = sa['n_samples'] + sb['n_samples']
 
-        # Return 0 if we don't have enough points to fit a linear model (as we will perfectly fit the data)
+        # Return 0 if we don't have enough points to fit a linear model, to avoid numerical issues
         if n_samples_total <= self.n_feat:
             return self.dtype(0.0), self.dtype(0.0)
 
@@ -277,12 +279,10 @@ class RSCAC:
         rss_ab = yss - beta @ xty
         delta_rss = rss_ab - (sa['RSS'] + sb['RSS'])
 
-        # Merging two clusters should always increase the RSS (if not, probably due to the pseudo-inverse fallback)
-        if delta_rss < 0:
-            print(
-                f"Warning: negative delta_RSS for clusters {ru} and {rv} (n_samples_total = {n_samples_total})"
-                f": {delta_rss:.3f} < 0. Setting to 0."
-            )
+        # Merging two clusters should always increase the RSS
+        # (if not, probably due to the pseudo-inverse fallback or numerical artifacts)
+        # We clip both positive and negative small values to zero to not give priority to such merges over each other
+        if np.abs(delta_rss) < self.rss_delta_atol:
             delta_rss = self.dtype(0.0)
             rss_ab = sa['RSS'] + sb['RSS']
 
