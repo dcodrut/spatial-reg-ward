@@ -26,7 +26,7 @@ class RSCAC:
             coords: np.ndarray = None,
             dist_mat: np.ndarray = None,
             min_cluster_size: int = 1,
-            use_cluster_knn: bool = False,
+            use_cluster_nn: bool = False,
             fit_intercept: bool = True,
             dtype=np.float64,
             rss_delta_atol: float = 1e-6,
@@ -41,7 +41,7 @@ class RSCAC:
         self.x, self.y = x.astype(dtype), y.astype(dtype)
         self.n_clusters = int(n_clusters)
         self.min_cluster_size = int(min_cluster_size)
-        self.use_cluster_knn = bool(use_cluster_knn)
+        self.use_cluster_nn = bool(use_cluster_nn)
         self.dtype = dtype
         self.rss_delta_atol = self.dtype(rss_delta_atol)
         self.pbar = pbar
@@ -96,7 +96,7 @@ class RSCAC:
             }
             self._members[i] = {i}
 
-        # 1) Build base adjacency from W (if given, otherwise, we expect use_cluster_knn to be True)
+        # 1) Build base adjacency from W (if given, otherwise, we expect use_cluster_nn to be True)
         self.adj_base: Dict[int, Dict[int, np.floating]] = {i: {} for i in range(self.n_samples)}
 
         if w is not None:
@@ -114,17 +114,17 @@ class RSCAC:
                     jj = id2pos[j_id]
                     self._add_edge(self.adj_base, ii, jj, self.dist_mat[ii, jj])
         else:
-            if not self.use_cluster_knn:
-                raise ValueError("No contiguity `w` provided. Either supply `w` or enable `use_cluster_knn=True`.")
+            if not self.use_cluster_nn:
+                raise ValueError("No contiguity `w` provided. Either supply `w` or enable `use_cluster_nn=True`.")
         deg = {u: len(nbrs) for u, nbrs in self.adj_base.items()}
         print(
             f"adj_base stats: #nodes: {len(deg)}, #edges: {sum(deg.values()) // 2}, "
             f"min/mean/max degree: {min(deg.values())}/{np.mean(list(deg.values())):.1f}/{max(deg.values())}"
         )
 
-        # 2) If `use_cluster_knn` is set to True, extend the adjacency with k-NN outside each "cluster"
+        # 2) If `use_cluster_nn` is set to True, extend the adjacency with k-NN outside each "cluster"
         # (i.e. point since we start with each point as a cluster, so equivalent to a standard k-NN)
-        if self.use_cluster_knn:
+        if self.use_cluster_nn:
             # Build pre-sorted neighbor index once; store neighbors (excluding self) by ascending distance
             order = np.argsort(self.dist_mat, axis=1).astype(np.int32)
             self._order_mat = np.empty((self.n_samples, self.n_samples - 1), dtype=np.int32)
@@ -141,15 +141,15 @@ class RSCAC:
             self._cursor = np.zeros(self.n_samples, dtype=np.int32)
 
             # Initialize the extended adjacency structure
-            self.adj_cknn: Dict[int, Dict[int, np.floating]] = {i: {} for i in range(self.n_samples)}
+            self.adj_c_nn: Dict[int, Dict[int, np.floating]] = {i: {} for i in range(self.n_samples)}
             for rep in self._members:
-                edges = self._compute_cluster_knn_for(rep)
+                edges = self._compute_cluster_nn_for(rep)
                 for tgt, d in edges.items():
-                    self._add_edge(self.adj_cknn, rep, tgt, d)
+                    self._add_edge(self.adj_c_nn, rep, tgt, d)
 
-            deg = {u: len(nbrs) for u, nbrs in self.adj_cknn.items()}
+            deg = {u: len(nbrs) for u, nbrs in self.adj_c_nn.items()}
             print(
-                f"adj_cknn stats: #nodes: {len(deg)}, #edges: {sum(deg.values()) // 2}, "
+                f"adj_c_nn stats: #nodes: {len(deg)}, #edges: {sum(deg.values()) // 2}, "
                 f"min/mean/max degree: {min(deg.values())}/{np.mean(list(deg.values())):.1f}/{max(deg.values())}"
             )
 
@@ -212,7 +212,7 @@ class RSCAC:
             return self._find(q), self.dist_mat[p, q]
         return None
 
-    def _compute_cluster_knn_for(self, rep: int) -> Dict[int, np.floating]:
+    def _compute_cluster_nn_for(self, rep: int) -> Dict[int, np.floating]:
         """
         Given the current cluster `rep`, for EACH member point pick its SINGLE nearest neighbor that lies in a
         different cluster. Return the distinct target clusters with the minimum witnessing distance per target.
@@ -229,9 +229,9 @@ class RSCAC:
         return targets
 
     def _refresh_adj(self):
-        """Update the union of base and cKNN adjacency."""
+        """Update the union of base and cNN adjacency."""
 
-        if not self.use_cluster_knn:
+        if not self.use_cluster_nn:
             # If we don't extend adjacency, just use the base adjacency
             self.adj = self.adj_base
             return
@@ -242,7 +242,7 @@ class RSCAC:
             for v, d in nbrs.items():
                 self._add_edge(adj, u, v, d)
 
-        for u, nbrs in self.adj_cknn.items():
+        for u, nbrs in self.adj_c_nn.items():
             for v, d in nbrs.items():
                 self._add_edge(adj, u, v, d)
 
@@ -321,32 +321,32 @@ class RSCAC:
         # Remove representative `drop`
         self.adj_base.pop(drop, None)
 
-    def _rebuild_cknn_after_merge_for(self, reps: Set[int]):
+    def _rebuild_c_nn_after_merge_for(self, reps: Set[int]):
         """
-        Two-steps local rebuild for cKNN on a set of representatives:
+        Two-steps local rebuild for cNN on a set of representatives:
             Step 1: compute new edges for each rep.
             Step 2: wipe current incident edges for those reps and re-add exactly the new edges (symmetrically).
         """
-        if not self.use_cluster_knn or not reps:
+        if not self.use_cluster_nn or not reps:
             return
 
         # Step 1: compute new edges per rep
         new_edges_map: Dict[int, Dict[int, np.floating]] = {}
         for rep in reps:
             if rep in self._members:  # still alive
-                new_edges_map[rep] = self._compute_cluster_knn_for(rep)
+                new_edges_map[rep] = self._compute_cluster_nn_for(rep)
 
         # Step 2: wipe current incident edges for touched reps (symmetrically)
         for rep in new_edges_map.keys():
-            for nb in list(self.adj_cknn.get(rep, {}).keys()):
+            for nb in list(self.adj_c_nn.get(rep, {}).keys()):
                 # remove both directions
-                self.adj_cknn[nb].pop(rep, None)
-            self.adj_cknn[rep] = {}
+                self.adj_c_nn[nb].pop(rep, None)
+            self.adj_c_nn[rep] = {}
 
         # Re-add the new edges
         for rep, edges in new_edges_map.items():
             for nb, d in edges.items():
-                self._add_edge(self.adj_cknn, rep, nb, d)
+                self._add_edge(self.adj_c_nn, rep, nb, d)
 
     def _merge(self, u, v, new_rss):
         # Get the root representatives of u and v
@@ -358,10 +358,10 @@ class RSCAC:
         # Set the new representative
         keep, drop = ru, rv
 
-        # Save the cKNN neighbors before the merge (for touched set)
-        if self.use_cluster_knn:
-            cknn_neigh_keep = set(self.adj_cknn.get(keep, {}).keys())
-            cknn_neigh_drop = set(self.adj_cknn.get(drop, {}).keys())
+        # Save the cNN neighbors before the merge (for touched set)
+        if self.use_cluster_nn:
+            c_nn_neigh_keep = set(self.adj_c_nn.get(keep, {}).keys())
+            c_nn_neigh_drop = set(self.adj_c_nn.get(drop, {}).keys())
 
         # Update the base adjacency structure after merging
         self._rebuild_base_after_merge(keep, drop)
@@ -381,17 +381,17 @@ class RSCAC:
         del self._stats[drop]
 
         # Update cluster‑kNN layer (with local rebuild, i.e. only the affected representatives)
-        if self.use_cluster_knn:
+        if self.use_cluster_nn:
             # These are the nodes whose cluster‑kNN needs to be recomputed
-            touched: Set[int] = {keep} | cknn_neigh_keep | cknn_neigh_drop
+            touched: Set[int] = {keep} | c_nn_neigh_keep | c_nn_neigh_drop
 
             # Remove the dropped rep’s entry and all edges to it
-            for nb in list(self.adj_cknn.get(drop, {}).keys()):
-                self.adj_cknn[nb].pop(drop, None)
-            self.adj_cknn.pop(drop, None)
+            for nb in list(self.adj_c_nn.get(drop, {}).keys()):
+                self.adj_c_nn[nb].pop(drop, None)
+            self.adj_c_nn.pop(drop, None)
 
             # Recompute cluster‑kNN for all the touched nodes
-            self._rebuild_cknn_after_merge_for(touched)
+            self._rebuild_c_nn_after_merge_for(touched)
 
         # Refresh the adjacency structure
         self._refresh_adj()
