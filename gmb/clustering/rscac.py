@@ -27,6 +27,7 @@ class RSCAC:
             dist_mat: np.ndarray = None,
             min_cluster_size: int = 1,
             use_cluster_nn: bool = False,
+            cluster_nn_k: int = None,
             fit_intercept: bool = True,
             dtype=np.float64,
             rss_delta_atol: float = 1e-6,
@@ -42,6 +43,7 @@ class RSCAC:
         self.n_clusters = int(n_clusters)
         self.min_cluster_size = int(min_cluster_size)
         self.use_cluster_nn = bool(use_cluster_nn)
+        self.cluster_nn_k = cluster_nn_k
         self.dtype = dtype
         self.rss_delta_atol = self.dtype(rss_delta_atol)
         self.pbar = pbar
@@ -154,6 +156,9 @@ class RSCAC:
                 f"min/mean/max degree: {min(deg.values())}/{np.mean(list(deg.values())):.1f}/{max(deg.values())}"
             )
 
+            if self.cluster_nn_k is not None and self.cluster_nn_k <= 0:
+                raise ValueError("cluster_nn_k must be a positive integer or None.")
+
         # merge the base and extended adjacency into a single adjacency structure
         self._refresh_adj()
 
@@ -217,6 +222,7 @@ class RSCAC:
         """
         Given the current cluster `rep`, for EACH member point pick its SINGLE nearest neighbor that lies in a
         different cluster. Return the distinct target clusters with the minimum witnessing distance per target.
+        Limit to at most k nearest neighboring clusters if cluster_nn_k is set.
         """
         targets: Dict[int, np.floating] = {}
         for p in self._members[rep]:
@@ -227,6 +233,13 @@ class RSCAC:
             prev = targets.get(tgt, self._inf)
             if d < prev:
                 targets[tgt] = d
+
+        # Limit to at most cluster_nn_k nearest neighboring clusters (per cluster, outgoing)
+        if self.cluster_nn_k is not None and 0 < self.cluster_nn_k < len(targets):
+            items = sorted(targets.items(), key=lambda kv: kv[1])
+            items = items[: self.cluster_nn_k]
+            targets = {t: dist for t, dist in items}
+
         return targets
 
     def _refresh_adj(self):
