@@ -13,8 +13,8 @@ from scipy.spatial.distance import pdist, squareform
 #   - delete the asserts at the end
 
 
-class RSCAC:
-    """Regression-based Spatially-Constrained Agglomerative Clustering"""
+class SpatialRegWard:
+    """Spatially Constrained Agglomerative Clustering with a Regression-based Ward-style Objective """
 
     def __init__(
             self,
@@ -404,7 +404,7 @@ class RSCAC:
 
         if self.pbar:
             from tqdm import tqdm
-            pbar = tqdm(total=self.n_samples - 1, desc='RSCAC merges')
+            pbar = tqdm(total=self.n_samples - 1, desc='SpatialRegWard merges')
 
             # Compute TSS for the entire dataset (for information only)
             y_mean = np.mean(self.y)
@@ -461,8 +461,8 @@ class RSCAC:
 
         if k != 1:
             print(
-                f"Warning: RSCAC should stop when everything is merged into one cluster but we still have {k} clusters "
-                f"(probably disconnected components)."
+                f"Warning: SpatialRegWard should stop when everything is merged into one cluster "
+                f"but we still have {k} clusters (probably disconnected components)."
             )
 
         # Get the labels for the requested number of clusters
