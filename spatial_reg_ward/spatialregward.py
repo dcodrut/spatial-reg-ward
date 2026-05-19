@@ -11,6 +11,9 @@ from scipy.spatial.distance import pdist, squareform
 #   - add documentation
 #   - check if the model is fitted before running get_clustering
 #   - delete the asserts at the end
+#   - make sure we don't have duplicates in the heap
+#   - check why the last few iterations are very slow sometimes
+#   - use conditional imports to reduce the number of dependencies
 
 
 class SpatialRegWard:
@@ -271,6 +274,7 @@ class SpatialRegWard:
 
     def _find(self, u):
         """Path-compressed DSU find."""
+        # ToDo: check https://cp-algorithms.com/data_structures/disjoint_set_union.html#union-by-size-rank
         if self._parent[u] != u:
             self._parent[u] = self._find(self._parent[u])
         return self._parent[u]
@@ -484,7 +488,9 @@ class SpatialRegWard:
             sizes = np.bincount(labels)
             if min(sizes) < self.min_cluster_size:
                 print(
-                    f"Warning: the minimum cluster size constraint of {self.min_cluster_size} is not satisfied. "
-                    f"The smallest cluster has size {min(sizes)}. Reconsider decreasing min_cluster_size."
+                    f"Warning: requested clustering into {k} clusters, but "
+                    f"the minimum cluster size constraint of {self.min_cluster_size} is not satisfied. "
+                    f"The smallest cluster has size {min(sizes)} (all sizes = {sizes}). "
+                    f"Consider decreasing min_cluster_size."
                 )
         return labels
