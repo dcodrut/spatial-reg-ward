@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spatial-reg-ward"
+version = "0.0.1"
+description = "Spatially constrained agglomerative clustering with a regression-based Ward objective."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [ { name = "Codrut-Andrei Diaconu"} ]
+dependencies = [
+  "numpy>=1.20",
+  "scipy>=1.7",
+  "libpysal>=4.14.0",
+  "tqdm>=4.0"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+

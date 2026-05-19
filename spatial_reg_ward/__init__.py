@@ -1,0 +1,8 @@
+"""spatial_reg_ward package
+
+This package exposes the SpatialRegWard clustering class.
+"""
+from .spatialregward import SpatialRegWard
+
+__all__ = ["SpatialRegWard"]
+
