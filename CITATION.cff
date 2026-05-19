@@ -1,0 +1,25 @@
+cff-version: "1.2.0"
+message: "If you use this software, please cite it using the metadata from this file."
+type: software
+
+title: "spatial-reg-ward"
+version: "v0.1.0"
+date-released: "2026-05-19"
+
+authors:
+  - family-names: "Diaconu"
+    given-names: "Codruț-Andrei"
+    orcid: "https://orcid.org/0009-0000-1941-0139"
+
+doi: "10.5281/zenodo.20283115"
+repository-code: "https://github.com/dcodrut/spatial-reg-ward"
+license: "MIT"
+
+abstract: "Python package providing SpatialRegWard, a spatially constrained agglomerative clustering algorithm that uses a regression-based Ward-style objective."
+
+keywords:
+  - "spatial clustering"
+  - "agglomerative clustering"
+  - "Ward clustering"
+  - "regression"
+  - "Python"
